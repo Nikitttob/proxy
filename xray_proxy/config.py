@@ -4,7 +4,9 @@
 """
 from __future__ import annotations
 
+import fcntl
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List
@@ -55,6 +57,7 @@ class Settings:
     cdn_ws_path: str
     reality_port: int = 443
     cdn_public_port: int = 443
+    cdn_origin_port: int = 8443
 
     # Telegram bot
     bot_token: str = ""
@@ -111,6 +114,7 @@ def load(env_path: str | None = None) -> Settings:
         server_label=_env("SERVER_LABEL", "xray-proxy"),
         cdn_domain=_env("CDN_DOMAIN"),
         cdn_local_port=_env_int("CDN_LOCAL_PORT", 8080),
+        cdn_origin_port=_env_int("CDN_ORIGIN_PORT", 8443),
         cdn_ws_path=_env("CDN_WS_PATH", "/stream"),
         bot_token=_env("BOT_TOKEN"),
         admin_ids=admin_ids,
@@ -137,31 +141,49 @@ def load(env_path: str | None = None) -> Settings:
     )
 
 
+@contextmanager
+def _flock(path: Path):
+    """Файловая блокировка через отдельный lock-файл (живёт рядом с .env)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def update_env_file(path: Path, updates: dict) -> None:
-    """Обновить ключи в .env-файле, сохранив остальное."""
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("")
+    """Обновить ключи в .env-файле, сохранив остальное.
 
-    lines = path.read_text().splitlines()
-    seen: set = set()
-    out = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            out.append(line)
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in updates:
-            out.append(f"{key}={updates[key]}")
-            seen.add(key)
-        else:
-            out.append(line)
+    Атомарно (через tmp + replace) и под эксклюзивной блокировкой —
+    бот и менеджер могут писать одновременно.
+    """
+    with _flock(path):
+        if not path.exists():
+            path.write_text("")
 
-    for key, val in updates.items():
-        if key not in seen:
-            out.append(f"{key}={val}")
+        lines = path.read_text().splitlines()
+        seen: set = set()
+        out = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                out.append(line)
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key in updates:
+                out.append(f"{key}={updates[key]}")
+                seen.add(key)
+            else:
+                out.append(line)
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("\n".join(out) + "\n")
-    tmp.replace(path)
+        for key, val in updates.items():
+            if key not in seen:
+                out.append(f"{key}={val}")
+
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("\n".join(out) + "\n")
+        tmp.replace(path)

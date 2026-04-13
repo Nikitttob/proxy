@@ -1,17 +1,32 @@
 #!/bin/bash
 # Шаблон cloud-init для нового VPS.
 # Подставляются через Python string.Template:
-#   $XRAY_CONFIG_JSON — готовый JSON Xray
-#   $SSH_PUBLIC_KEY   — публичный SSH-ключ администратора
-#   $CDN_DOMAIN       — домен для Caddy
-#   $CDN_LOCAL_PORT   — локальный порт WS
+#   $XRAY_CONFIG_JSON       — готовый JSON Xray
+#   $SSH_PUBLIC_KEY         — публичный SSH-ключ администратора
+#   $CDN_DOMAIN             — домен для Caddy / TLS
+#   $CDN_LOCAL_PORT         — loopback-порт Xray WS (доступен только Caddy)
+#   $CDN_ORIGIN_PORT        — порт, на котором Caddy слушает CF (8443)
+#   $CLOUDFLARE_API_TOKEN   — для DNS-01 ACME challenge
+#
+# Архитектура портов:
+#   :443  Reality (TCP, занят Xray)
+#   :8443 Caddy (TLS-терминатор для WS, CF→origin через Origin Rule)
+#   :80   ACME HTTP-01 НЕ используется (CF в режиме proxy ломает его).
+#         Сертификат — DNS-01 через certbot-cloudflare.
+#
+# В CF нужно вручную (один раз):
+#   Rules → Origin Rules → Create rule:
+#     If host equals $CDN_DOMAIN → Override resolved port = $CDN_ORIGIN_PORT
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # ---------- базовые обновления ----------
 apt-get update
 apt-get upgrade -y
-apt-get install -y curl ufw fail2ban ca-certificates debian-keyring debian-archive-keyring apt-transport-https gnupg
+apt-get install -y \
+    curl ufw fail2ban ca-certificates gnupg \
+    debian-keyring debian-archive-keyring apt-transport-https \
+    certbot python3-certbot-dns-cloudflare
 
 # ---------- SSH: только ключи ----------
 install -m 700 -d /root/.ssh
@@ -28,9 +43,9 @@ systemctl reload ssh || systemctl reload sshd || true
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
-ufw limit 22/tcp comment 'ssh rate-limit'
-ufw allow 80/tcp   comment 'http (acme + caddy)'
-ufw allow 443/tcp  comment 'xray reality + caddy tls'
+ufw limit 22/tcp        comment 'ssh rate-limit'
+ufw allow 443/tcp       comment 'xray reality'
+ufw allow 8443/tcp      comment 'caddy tls (cloudflare origin)'
 ufw --force enable
 
 # ---------- fail2ban ----------
@@ -44,7 +59,7 @@ bantime  = 1h
 F2B
 systemctl enable --now fail2ban
 
-# ---------- Xray ----------
+# ---------- Xray (Reality на :443) ----------
 bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 install -d -m 755 /usr/local/etc/xray
 cat > /usr/local/etc/xray/config.json <<'XRAYCONFIG'
@@ -52,7 +67,30 @@ $XRAY_CONFIG_JSON
 XRAYCONFIG
 systemctl enable --now xray
 
-# ---------- Caddy (TLS-терминатор для WS) ----------
+# ---------- Cloudflare credentials для certbot DNS-01 ----------
+install -d -m 700 /etc/letsencrypt
+cat > /etc/letsencrypt/cloudflare.ini <<CFCREDS
+dns_cloudflare_api_token = $CLOUDFLARE_API_TOKEN
+CFCREDS
+chmod 600 /etc/letsencrypt/cloudflare.ini
+
+# ---------- Сертификат Let's Encrypt (DNS-01) ----------
+certbot certonly --non-interactive --agree-tos \
+    --email "admin@$CDN_DOMAIN" \
+    --dns-cloudflare \
+    --dns-cloudflare-credentials /etc/letsencrypt/cloudflare.ini \
+    --dns-cloudflare-propagation-seconds 30 \
+    -d "$CDN_DOMAIN"
+
+# Хук на reload Caddy при автообновлении
+install -d /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/caddy.sh <<'HOOK'
+#!/bin/bash
+systemctl reload caddy 2>/dev/null || true
+HOOK
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/caddy.sh
+
+# ---------- Caddy (TLS-терминатор для WS на :8443) ----------
 curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
   | sed 's|deb |deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] |' \
@@ -61,7 +99,8 @@ apt-get update
 apt-get install -y caddy
 
 cat > /etc/caddy/Caddyfile <<CADDYCONF
-$CDN_DOMAIN {
+$CDN_DOMAIN:$CDN_ORIGIN_PORT {
+    tls /etc/letsencrypt/live/$CDN_DOMAIN/fullchain.pem /etc/letsencrypt/live/$CDN_DOMAIN/privkey.pem
     encode gzip
     @ws {
         path /stream
@@ -72,6 +111,13 @@ $CDN_DOMAIN {
     respond 404
 }
 CADDYCONF
+# Caddy должен иметь права читать /etc/letsencrypt/live (там symlink на archive).
+# Выдаём read-доступ через ACL/группу.
+chgrp -R caddy /etc/letsencrypt/live /etc/letsencrypt/archive
+chmod g+rx /etc/letsencrypt/live /etc/letsencrypt/archive
+find /etc/letsencrypt/live /etc/letsencrypt/archive -type d -exec chmod g+rx {} \;
+find /etc/letsencrypt/archive -type f -exec chmod g+r {} \;
+
 systemctl enable --now caddy
 
 echo "cloud-init finished at $(date -Iseconds)"

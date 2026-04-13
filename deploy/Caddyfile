@@ -1,13 +1,18 @@
 # Caddy — TLS-терминатор для WebSocket-канала.
-# Нужен, чтобы Cloudflare можно было перевести в Full (strict):
-# CF ↔ Caddy идёт настоящий TLS (Let's Encrypt), Caddy ↔ Xray — loopback.
 #
-# Требуется: домен указывает на сервер (A-запись), порт 80 и 443 открыты
-# в UFW для ACME challenge и боевого трафика.
+# Слушает :8443, потому что :443 занят Reality. Cloudflare ходит на этот порт
+# через Origin Rule (Rules → Origin Rules → Override resolved port = 8443).
+# Клиент по-прежнему ходит на CF на :443 (CDN_PUBLIC_PORT).
 #
-# $CDN_DOMAIN и $CDN_LOCAL_PORT подставляются при установке (envsubst).
+# Сертификат Let's Encrypt получает certbot через DNS-01 (Cloudflare API
+# token), потому что HTTP-01 не работает (CF проксирует), а TLS-ALPN-01
+# требует свободный :443 (его занимает Reality).
+#
+# Подставляются через envsubst при установке: $CDN_DOMAIN, $CDN_LOCAL_PORT.
 
-{$CDN_DOMAIN} {
+{$CDN_DOMAIN}:8443 {
+    tls /etc/letsencrypt/live/{$CDN_DOMAIN}/fullchain.pem /etc/letsencrypt/live/{$CDN_DOMAIN}/privkey.pem
+
     encode gzip
 
     @ws {
@@ -17,6 +22,6 @@
     }
     reverse_proxy @ws 127.0.0.1:{$CDN_LOCAL_PORT}
 
-    # Всё остальное — отдаём 404, чтобы не светиться как прокси.
+    # Всё остальное — 404, чтобы не светиться как прокси.
     respond 404
 }
