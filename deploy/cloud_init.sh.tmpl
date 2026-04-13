@@ -1,0 +1,77 @@
+#!/bin/bash
+# Шаблон cloud-init для нового VPS.
+# Подставляются через Python string.Template:
+#   $XRAY_CONFIG_JSON — готовый JSON Xray
+#   $SSH_PUBLIC_KEY   — публичный SSH-ключ администратора
+#   $CDN_DOMAIN       — домен для Caddy
+#   $CDN_LOCAL_PORT   — локальный порт WS
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+# ---------- базовые обновления ----------
+apt-get update
+apt-get upgrade -y
+apt-get install -y curl ufw fail2ban ca-certificates debian-keyring debian-archive-keyring apt-transport-https gnupg
+
+# ---------- SSH: только ключи ----------
+install -m 700 -d /root/.ssh
+cat > /root/.ssh/authorized_keys <<'SSHKEY'
+$SSH_PUBLIC_KEY
+SSHKEY
+chmod 600 /root/.ssh/authorized_keys
+
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+systemctl reload ssh || systemctl reload sshd || true
+
+# ---------- firewall ----------
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw limit 22/tcp comment 'ssh rate-limit'
+ufw allow 80/tcp   comment 'http (acme + caddy)'
+ufw allow 443/tcp  comment 'xray reality + caddy tls'
+ufw --force enable
+
+# ---------- fail2ban ----------
+cat > /etc/fail2ban/jail.d/sshd.local <<'F2B'
+[sshd]
+enabled = true
+port    = 22
+maxretry = 5
+findtime = 10m
+bantime  = 1h
+F2B
+systemctl enable --now fail2ban
+
+# ---------- Xray ----------
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+install -d -m 755 /usr/local/etc/xray
+cat > /usr/local/etc/xray/config.json <<'XRAYCONFIG'
+$XRAY_CONFIG_JSON
+XRAYCONFIG
+systemctl enable --now xray
+
+# ---------- Caddy (TLS-терминатор для WS) ----------
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+  | sed 's|deb |deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] |' \
+  > /etc/apt/sources.list.d/caddy-stable.list
+apt-get update
+apt-get install -y caddy
+
+cat > /etc/caddy/Caddyfile <<CADDYCONF
+$CDN_DOMAIN {
+    encode gzip
+    @ws {
+        path /stream
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @ws 127.0.0.1:$CDN_LOCAL_PORT
+    respond 404
+}
+CADDYCONF
+systemctl enable --now caddy
+
+echo "cloud-init finished at $(date -Iseconds)"

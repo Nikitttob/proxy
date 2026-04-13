@@ -1,0 +1,23 @@
+[Unit]
+Description=Xray Telegram Bot
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/xray-proxy/env
+Environment=PYTHONUNBUFFERED=1
+Environment=XRAY_PROXY_ENV=/etc/xray-proxy/env
+WorkingDirectory=/opt/xray-proxy
+ExecStart=/usr/bin/python3 /opt/xray-proxy/bot/xray_bot.py
+Restart=always
+RestartSec=5
+
+# Базовая sandbox-изоляция. Бот должен уметь рестартить xray,
+# поэтому PrivateUsers / CapabilityBoundingSet жёстко не ставим.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

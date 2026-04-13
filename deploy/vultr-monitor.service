@@ -1,0 +1,22 @@
+[Unit]
+Description=Vultr Xray-proxy Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/xray-proxy/env
+Environment=PYTHONUNBUFFERED=1
+Environment=XRAY_PROXY_ENV=/etc/xray-proxy/env
+WorkingDirectory=/opt/xray-proxy
+ExecStart=/usr/bin/python3 /opt/xray-proxy/manager/vultr_manager.py monitor
+Restart=always
+RestartSec=30
+
+StateDirectory=xray-proxy
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

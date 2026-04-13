@@ -1,0 +1,25 @@
+# secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+users.json
+vultr_state.json
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# logs
+*.log
+logs/

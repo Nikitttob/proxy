@@ -1,0 +1,22 @@
+# Caddy — TLS-терминатор для WebSocket-канала.
+# Нужен, чтобы Cloudflare можно было перевести в Full (strict):
+# CF ↔ Caddy идёт настоящий TLS (Let's Encrypt), Caddy ↔ Xray — loopback.
+#
+# Требуется: домен указывает на сервер (A-запись), порт 80 и 443 открыты
+# в UFW для ACME challenge и боевого трафика.
+#
+# $CDN_DOMAIN и $CDN_LOCAL_PORT подставляются при установке (envsubst).
+
+{$CDN_DOMAIN} {
+    encode gzip
+
+    @ws {
+        path /stream
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    reverse_proxy @ws 127.0.0.1:{$CDN_LOCAL_PORT}
+
+    # Всё остальное — отдаём 404, чтобы не светиться как прокси.
+    respond 404
+}
