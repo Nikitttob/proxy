@@ -135,27 +135,34 @@ vless://{UUID}@{CDN_DOMAIN}:443?encryption=none&security=tls
 
 ---
 
-## 7. Файрвол (UFW)
+## 7. Порты и файрвол (UFW)
 
-Конфигурируется автоматически в [`deploy/cloud_init.sh.tmpl`](./deploy/cloud_init.sh.tmpl):
+Reality и Caddy не могут оба слушать `:443`, поэтому разнесены:
 
-```
-22/tcp   limit  — SSH (rate-limit от брутфорса)
-80/tcp   allow  — ACME challenge + HTTP-редирект Caddy
-443/tcp  allow  — Reality (TCP) и Caddy (TLS)
-```
+| Порт | Слушает | Кто ходит |
+|------|---------|-----------|
+| `22/tcp`   | sshd | админ (с rate-limit через `ufw limit`) |
+| `443/tcp`  | Xray (Reality, TCP) | home-клиенты напрямую |
+| `8443/tcp` | Caddy (TLS-терминатор) | **только Cloudflare** |
+| `127.0.0.1:8080` | Xray (WS-inbound) | только Caddy |
 
-Доступ к 443 одновременно используется Reality (на 0.0.0.0) и Caddy
-(он слушает только то, что Reality не отдаёт — `:443` Reality занимает,
-поэтому Caddy слушает 80 → `http_port`-redirect, а CDN-клиенты заходят
-через CF на нашу 443; см. примечание в `Caddyfile`, при необходимости
-переключить Caddy на 8443 и в CF указать origin port).
+CDN-клиент по-прежнему идёт на CF на :443 — CF проксирует в origin на :8443
+через **Origin Rule**:
 
-> ⚠️ Если планируется WS на том же :443, что и Reality — нужно разделить:
-> либо разные домены, либо Reality слушает 8443, а Caddy 443.
-> Текущая дефолтная конфигурация: Reality на :443, Caddy на :443
-> только если Reality остановлен. На практике они конфликтуют — выбрать одну
-> из схем под свою задачу.
+> CF dashboard → Rules → **Origin Rules** → Create rule:
+> «If Hostname equals `proxy.example.com` → Override resolved port = `8443`».
+
+Сертификат Let's Encrypt получает `certbot` через DNS-01 (плагин
+`python3-certbot-dns-cloudflare`), потому что:
+- HTTP-01 не работает: CF проксирует и редиректит :80 → :443 на edge.
+- TLS-ALPN-01 не работает: :443 занят Reality.
+- DNS-01 надёжен и не требует пробрасывать порты для challenge.
+
+Хук `/etc/letsencrypt/renewal-hooks/deploy/caddy.sh` перезагружает Caddy при
+автообновлении сертификата.
+
+Конфиг файрвола ставится автоматически в
+[`deploy/cloud_init.sh.tmpl`](./deploy/cloud_init.sh.tmpl).
 
 ---
 
@@ -248,9 +255,13 @@ journalctl -u vultr-monitor -f
 journalctl -u caddy -f
 ```
 
-### Бэкап users.json
-Автоматически каждый день в 03:30 в `/var/backups/xray-proxy/`,
-ротация 14 дней — см. [`scripts/backup_users.sh`](./scripts/backup_users.sh).
+### Бэкап секретов и базы пользователей
+Автоматически каждый день в 03:30 в `/var/backups/xray-proxy/` (ротация 14 дней)
+бэкапится и `users.json`, и `/etc/xray-proxy/env`. Без `.env` при гибели VPS
+теряются все ключи — Reality, BOT_TOKEN, VULTR_API_KEY, CLOUDFLARE_API_TOKEN.
+Архивы лежат с правами `600` — содержат секреты, синхронизировать
+куда-то наружу нужно осторожно (gpg-encrypt → S3/B2/локальный диск).
+См. [`scripts/backup_users.sh`](./scripts/backup_users.sh).
 
 ### При блокировке IP
 1. `python3 manager/vultr_manager.py recreate` — пересоздать VPS.
@@ -309,6 +320,11 @@ systemctl restart xray xray-bot
 - [x] cooldown алертов
 - [x] `/bind` для `/mykey`
 - [x] cloud-init: SSH-only, fail2ban, ufw limit
-- [ ] Рассмотреть миграцию на 3x-ui / Marzban / Hiddify (см. README)
+- [x] Конфликт Reality :443 vs Caddy :443 решён (Caddy → :8443 + CF Origin Rule)
+- [x] Бэкап включает `.env`
+- [x] Atomic + flock запись `.env` (`update_env_file`)
+- [x] Уникальные timestamped label при пересоздании VPS
+- [ ] Создать в Cloudflare Origin Rule (Override port → 8443) для CDN-домена
 - [ ] Заполнить `CLOUDFLARE_API_TOKEN` в `/etc/xray-proxy/env`
-- [ ] Решить конфликт Reality :443 vs Caddy :443 (см. раздел 7)
+- [ ] Настроить выгрузку `/var/backups/xray-proxy/` куда-то наружу (gpg+S3)
+- [ ] Рассмотреть миграцию на 3x-ui / Marzban / Hiddify (см. README)

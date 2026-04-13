@@ -70,17 +70,43 @@ def _vultr_headers(s: Settings) -> dict:
     }
 
 
-def find_server(s: Settings) -> Optional[dict]:
+def get_instance(s: Settings, instance_id: str) -> Optional[dict]:
+    r = requests.get(
+        f"{VULTR_API}/instances/{instance_id}",
+        headers=_vultr_headers(s),
+        timeout=HTTP_TIMEOUT,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json().get("instance")
+
+
+def find_server(s: Settings, state: dict | None = None) -> Optional[dict]:
+    """Найти текущий инстанс. Сначала по ID из state, потом по label-prefix."""
+    if state and state.get("current_id"):
+        inst = get_instance(s, state["current_id"])
+        if inst:
+            return inst
+
     r = requests.get(
         f"{VULTR_API}/instances",
         headers=_vultr_headers(s),
         timeout=HTTP_TIMEOUT,
     )
     r.raise_for_status()
-    for inst in r.json().get("instances", []):
-        if inst["label"] == s.server_label:
-            return inst
-    return None
+    # Новые инстансы создаются с label `{server_label}-{ts}`, поэтому
+    # ищем как точное совпадение, так и префикс.
+    candidates = [
+        inst for inst in r.json().get("instances", [])
+        if inst["label"] == s.server_label
+        or inst["label"].startswith(f"{s.server_label}-")
+    ]
+    if not candidates:
+        return None
+    # Берём самый свежий по `date_created`.
+    candidates.sort(key=lambda x: x.get("date_created", ""), reverse=True)
+    return candidates[0]
 
 
 def delete_server(s: Settings, server_id: str) -> None:
@@ -101,16 +127,18 @@ def generate_cloud_init(s: Settings, users: dict) -> str:
         SSH_PUBLIC_KEY=s.ssh_public_key,
         CDN_DOMAIN=s.cdn_domain,
         CDN_LOCAL_PORT=str(s.cdn_local_port),
+        CDN_ORIGIN_PORT=str(s.cdn_origin_port),
+        CLOUDFLARE_API_TOKEN=s.cloudflare_api_token,
     )
 
 
-def create_server(s: Settings, users: dict) -> str:
-    log.info("creating server in %s / %s", s.server_region, s.server_plan)
+def create_server(s: Settings, users: dict, label: str) -> str:
+    log.info("creating server '%s' in %s / %s", label, s.server_region, s.server_plan)
     body = {
         "region": s.server_region,
         "plan": s.server_plan,
         "os_id": s.server_os_id,
-        "label": s.server_label,
+        "label": label,
         "user_data": generate_cloud_init(s, users),
         "backups": "disabled",
     }
@@ -249,65 +277,57 @@ def collect_links(s: Settings, users: dict, ip: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def recreate(s: Settings) -> None:
+    """Создаём новый инстанс с уникальным label, ждём, обновляем DNS,
+    удаляем старый. Старый никогда не переименовывается — благодаря
+    timestamped label новый создаётся без конфликта."""
     log.info("=== RECREATE ===")
     send_telegram(s, "🔄 Пересоздаю сервер…")
 
     users = userdb.load_users(s.users_db)
-    old = find_server(s)
+    state = load_state(s.vultr_state_file)
+    old = find_server(s, state)
 
-    # Если текущий инстанс уже есть — временно переименуем, чтобы новый занял
-    # label. Иначе API не даст создать дубликат по тому же label.
-    if old:
-        try:
-            requests.patch(
-                f"{VULTR_API}/instances/{old['id']}",
-                headers=_vultr_headers(s),
-                json={"label": f"{s.server_label}-old"},
-                timeout=HTTP_TIMEOUT,
-            ).raise_for_status()
-        except requests.RequestException:
-            log.exception("could not rename old instance, продолжаю")
+    # Уникальный label с timestamp — никаких гонок с переименованием.
+    new_label = f"{s.server_label}-{int(time.time())}"
+    new_id = create_server(s, users, new_label)
 
-    new_id = create_server(s, users)
     try:
         new_ip = wait_for_server(s, new_id)
     except TimeoutError:
-        # Новый не поднялся — откатываем label старому, новый удаляем.
         log.error("new server did not come up, rolling back")
-        delete_server(s, new_id)
-        if old:
-            requests.patch(
-                f"{VULTR_API}/instances/{old['id']}",
-                headers=_vultr_headers(s),
-                json={"label": s.server_label},
-                timeout=HTTP_TIMEOUT,
-            )
+        try:
+            delete_server(s, new_id)
+        except requests.RequestException:
+            log.exception("не смог удалить недосозданный %s", new_id)
         send_telegram(s, "❌ Новый VPS не поднялся, старый оставлен.")
         raise
 
     if not wait_for_xray(new_ip):
-        log.warning("xray not reachable yet on %s, но продолжаю DNS-update", new_ip)
+        log.warning("xray not reachable on %s, продолжаю DNS-update", new_ip)
 
     update_dns(s, new_ip)
 
-    # Сохраняем users.json обратно — вдруг ensure_short_id сгенерил новые.
+    # Сохраняем users.json — ensure_short_id мог сгенерировать новые.
     userdb.save_users(s.users_db, users)
 
-    # Теперь можно удалить старый.
-    if old:
-        try:
-            delete_server(s, old["id"])
-        except requests.RequestException:
-            log.exception("не смог удалить старый инстанс %s", old["id"])
-
-    state = load_state(s.vultr_state_file)
+    # Сначала фиксируем переход в state — даже если delete упадёт, мы знаем
+    # текущий инстанс.
     state.update({
+        "current_id": new_id,
+        "current_label": new_label,
         "current_ip": new_ip,
         "fail_count": 0,
         "total_recreates": state.get("total_recreates", 0) + 1,
         "last_recreate": datetime.now().isoformat(timespec="seconds"),
     })
     save_state(s.vultr_state_file, state)
+
+    # Теперь удаляем старый.
+    if old and old["id"] != new_id:
+        try:
+            delete_server(s, old["id"])
+        except requests.RequestException:
+            log.exception("не смог удалить старый инстанс %s", old["id"])
 
     links = collect_links(s, users, new_ip)
     print(f"\n{'=' * 60}\n  Новый IP: {new_ip}\n{'=' * 60}")
@@ -324,13 +344,15 @@ def recreate(s: Settings) -> None:
 def monitor(s: Settings) -> None:
     log.info("=== MONITOR ===")
     state = load_state(s.vultr_state_file)
-    server = find_server(s)
+    server = find_server(s, state)
     if not server:
         log.error("сервер %s не найден в Vultr", s.server_label)
         return
+    state["current_id"] = server["id"]
+    state["current_label"] = server.get("label")
     state["current_ip"] = server.get("main_ip")
     save_state(s.vultr_state_file, state)
-    log.info("current ip: %s", state["current_ip"])
+    log.info("current: %s (%s)", state["current_ip"], state["current_id"])
 
     while True:
         time.sleep(s.check_interval)
@@ -364,18 +386,19 @@ def monitor(s: Settings) -> None:
 
 
 def status(s: Settings) -> None:
-    server = find_server(s)
     state = load_state(s.vultr_state_file)
+    server = find_server(s, state)
     if not server:
         print("Сервер не найден.")
         return
     ip = server.get("main_ip", "?")
     available = check_port(ip, 443, timeout=10)
-    print(f"Сервер:      {server['label']}")
-    print(f"IP:          {ip}")
-    print(f"Статус:      {server.get('status', '?')}")
-    print(f"Порт 443:    {'доступен' if available else 'НЕДОСТУПЕН'}")
-    print(f"Пересозданий:{state.get('total_recreates', 0)}")
+    print(f"Сервер:       {server['label']}")
+    print(f"ID:           {server['id']}")
+    print(f"IP:           {ip}")
+    print(f"Статус:       {server.get('status', '?')}")
+    print(f"Порт 443:     {'доступен' if available else 'НЕДОСТУПЕН'}")
+    print(f"Пересозданий: {state.get('total_recreates', 0)}")
 
 
 def main() -> None:
